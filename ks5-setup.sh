@@ -14,7 +14,7 @@
 #           pare-feu par invité (isolation entre VM), sauvegarde quotidienne
 #
 #  En une ligne, en root sur le serveur (session SSH interactive) :
-#    curl -fsSL https://raw.githubusercontent.com/kv5t/ks5-proxmox-setup/main/ks5-setup.sh | bash
+#    curl -fsSL https://raw.githubusercontent.com/GRIDAC/ks5-proxmox-setup/main/ks5-setup.sh | bash
 #  Options après « bash -s -- » (ex. … | bash -s -- -p), ou bash ks5-setup.sh [options] :
 #    -c  fichier de paramètres (défaut : ks5.conf du dossier courant ou du script)
 #    -y  aucune question : valeurs du fichier, contrôles automatiques
@@ -27,7 +27,7 @@
 set -Eeuo pipefail
 umask 077
 
-KS5_URL="https://raw.githubusercontent.com/kv5t/ks5-proxmox-setup/main/ks5-setup.sh"
+KS5_URL="https://raw.githubusercontent.com/GRIDAC/ks5-proxmox-setup/main/ks5-setup.sh"
 SELF="${BASH_SOURCE[0]:-}"
 if [[ -n $SELF && -f $SELF ]]; then
   SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"; SELF="${SCRIPT_DIR}/$(basename "$SELF")"
@@ -1519,6 +1519,6 @@ fi
 if (( REBOOT_NEEDED )); then warn "Nouveau noyau installé : redémarrer le serveur (reboot) dès que possible."; fi
 info "Récapitulatif enregistré dans ${SUMMARY_FILE}."
 info "Relancer avec les mêmes réponses : $(rerun_cmd -c "$ANSWERS_FILE")"
-info "Étapes suivantes (Coolify, DNS, Kobo) : https://github.com/kv5t/ks5-proxmox-setup#4-après-linstallation"
+info "Étapes suivantes (Coolify, DNS, Kobo) : https://github.com/GRIDAC/ks5-proxmox-setup#4-après-linstallation"
 exit 0
 }

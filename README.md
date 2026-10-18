@@ -5,7 +5,7 @@ applications web, en une commande. Interactif : les valeurs du KS-5 sont propos�
 (Entrée pour garder), modifiables si le serveur est différent. Sécurisé sans être compliqué.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kv5t/ks5-proxmox-setup/main/ks5-setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GRIDAC/ks5-proxmox-setup/main/ks5-setup.sh | bash
 ```
 
 À lancer **en root sur le serveur**, depuis une session SSH interactive (`ssh root@IP`).
@@ -74,13 +74,13 @@ matériel réel et l'affiche à côté de ces valeurs.
 
 ```bash
 ssh root@IP_DU_SERVEUR
-curl -fsSL https://raw.githubusercontent.com/kv5t/ks5-proxmox-setup/main/ks5-setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GRIDAC/ks5-proxmox-setup/main/ks5-setup.sh | bash
 ```
 
 Préférer lire le script avant de l'exécuter :
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/kv5t/ks5-proxmox-setup/main/ks5-setup.sh
+curl -fsSLO https://raw.githubusercontent.com/GRIDAC/ks5-proxmox-setup/main/ks5-setup.sh
 less ks5-setup.sh
 bash ks5-setup.sh
 ```
@@ -101,7 +101,7 @@ Durée : 20 à 40 minutes ; redémarrer ensuite si le script l'indique. Le scrip
 ce qui existe est conservé. Pour relancer avec les mêmes réponses :
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kv5t/ks5-proxmox-setup/main/ks5-setup.sh | bash -s -- -c /root/ks5-reponses.conf
+curl -fsSL https://raw.githubusercontent.com/GRIDAC/ks5-proxmox-setup/main/ks5-setup.sh | bash -s -- -c /root/ks5-reponses.conf
 ```
 
 Options : `-p` simulation, `-y` sans questions (valeurs du fichier de paramètres), `-c fichier`
