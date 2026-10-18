@@ -9,9 +9,12 @@
 #  Réseau   pont privé NAT (vmbr1) ; seuls 80/443 entrent, vers le routeur web
 #  Web      conteneur HAProxy : aiguillage des domaines vers les VM sans déchiffrer
 #           (chaque VM garde ses certificats Let's Encrypt, IP réelle par protocole PROXY)
-#  Admin    tunnels SSH vers l'interface Proxmox, Coolify et les VM (rien d'autre exposé)
-#  Invités  modèle Ubuntu cloud-init, VM Coolify / Kobo / serveurs gérés,
-#           pare-feu par invité (isolation entre VM), sauvegarde quotidienne
+#  Admin    HTTPS sans tunnel : proxmox.<domaine> (adresses d'administration) et
+#           coolify.<domaine>, servis par le routeur web ; SSH direct sur l'hôte
+#  Invités  modèle Ubuntu cloud-init, une VM Coolify unique qui pilote une VM Docker
+#           par grande stack (Kobo, data/BI, observatoire, recette), pare-feu par invité
+#           (isolation entre VM, flux entre stacks ouverts un par un), sauvegarde quotidienne
+#           locale et copie facultative vers un stockage hors serveur
 #
 #  En une ligne, en root sur le serveur (session SSH interactive) :
 #    curl -fsSL https://raw.githubusercontent.com/kv5t/ks5-proxmox-setup/main/ks5-setup.sh | bash
@@ -204,6 +207,11 @@ ENABLE_FIREWALL=1
 VM_ISOLATION=1
 GUI_LAN_ONLY=1
 ROLLBACK_DELAY=300
+ADMIN_ALLOW_FROM=""
+PVE_DOMAIN=""
+PVE_OPEN_TO_ALL=0
+COOLIFY_DOMAIN=""
+COOLIFY_ADMIN_ONLY=0
 HW_THREADS=""; HW_RAM_GB=""; HW_DISK_TYPE=""; HW_RAID=""; HW_USABLE_GB=""
 ZFS_ARC_MAX_GB=""
 HOST_RESERVE_GB=3
@@ -223,15 +231,23 @@ BACKUP_STORAGE="local"
 BACKUP_SCHEDULE="02:00"
 BACKUP_KEEP_DAILY=3
 BACKUP_KEEP_WEEKLY=2
+BACKUP_REMOTE_STORAGE=""
+BACKUP_REMOTE_SCHEDULE="03:30"
+BACKUP_REMOTE_KEEP_DAILY=7
+BACKUP_REMOTE_KEEP_WEEKLY=4
+BACKUP_REMOTE_KEEP_MONTHLY=6
 DISK_ALERT_PCT=80
 CT_ID=100; CT_NAME="entree"; CT_IP_SUFFIX=10; CT_CORES=1; CT_MEM_MB=512; CT_DISK_GB=8
 VMS=(
-  "101|coolify|2|4|50|11|coolify|2"
-  "102|kobo|4|12|300|12|kobo|3"
-  "103|uninef-prod|6|18|500|13|managed|3"
-  "105|perso-tests|4|10|250|15|managed|5"
+  "101|coolify|2|6|60|11|coolify|2|"
+  "102|kobo|4|14|300|12|managed|3|kobo,enketo,kc"
+  "103|data-bi|4|18|500|13|managed|3|monitoring,redash,lightdash,grist,teable"
+  "104|observatoire|2|8|150|14|managed|4|observatoire"
+  "105|recette|2|4|100|15|managed|5|test"
 )
-VM_FW_EXTRA=()
+VM_FW_EXTRA=(
+  "103|IN ACCEPT -source @104 -p tcp -dport 5432 -log nolog # PostgreSQL/PostGIS pour l'observatoire (104)"
+)
 
 if [[ -f "$CONF_FILE" ]]; then
   read -r conf_uid conf_mode < <(stat -c '%u %a' "$CONF_FILE")
@@ -456,8 +472,50 @@ ask_match BACKUP_SCHEDULE "Heure de la sauvegarde quotidienne" "$BACKUP_SCHEDULE
   '^([01][0-9]|2[0-3]):[0-5][0-9]$' "Format HH:MM attendu."
 ask_int BACKUP_KEEP_DAILY "Sauvegardes locales quotidiennes conservées" "$BACKUP_KEEP_DAILY" 1 14
 ask_int BACKUP_KEEP_WEEKLY "Sauvegardes locales hebdomadaires conservées" "$BACKUP_KEEP_WEEKLY" 0 8
+ask_match BACKUP_REMOTE_STORAGE "Stockage Proxmox hors serveur pour une copie des VM (PBS, NFS… déjà ajouté ; vide = aucun)" \
+  "$BACKUP_REMOTE_STORAGE" '^([A-Za-z][A-Za-z0-9_.-]*)?$' "Nom de stockage Proxmox attendu (voir « pvesm status »)."
+if [[ -n $BACKUP_REMOTE_STORAGE ]]; then
+  ask_match BACKUP_REMOTE_SCHEDULE "Heure de la copie hors serveur" "$BACKUP_REMOTE_SCHEDULE" \
+    '^([01][0-9]|2[0-3]):[0-5][0-9]$' "Format HH:MM attendu."
+else
+  warn "Sans copie hors serveur, une panne ou une perte du serveur emporte toutes les VM et leurs sauvegardes."
+fi
 ask_match WEB_DOMAIN "Domaine des sites publics (routes par défaut du routeur web)" "$WEB_DOMAIN" \
   '^[a-z0-9.-]+\.[a-z]{2,}$' "Nom de domaine attendu (ex. uninef.org)."
+
+DOMAIN_BODY='([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}'
+CIDR_LIST_RE='^([0-9a-fA-F:.]+(/[0-9]{1,3})?( +[0-9a-fA-F:.]+(/[0-9]{1,3})?)*)?$'
+info "Administration en HTTPS par le routeur web, sans tunnel."
+ask_match COOLIFY_DOMAIN "Adresse de Coolify" "${COOLIFY_DOMAIN:-coolify.${WEB_DOMAIN}}" \
+  "^${DOMAIN_BODY}\$" "Nom de domaine attendu (ex. coolify.${WEB_DOMAIN})."
+pve_default="${PVE_DOMAIN:-proxmox.${WEB_DOMAIN}}"
+[[ $pve_default != "-" ]] || pve_default=""
+ask_match PVE_DOMAIN "Adresse de l'interface Proxmox (« - » = non publiée)" "$pve_default" \
+  "^(${DOMAIN_BODY})?\$" "Nom de domaine attendu (ex. proxmox.${WEB_DOMAIN})."
+PVE_ROUTE="$PVE_DOMAIN"   # adresse réellement publiée par le routeur (vide = interface non publiée)
+ask_match ADMIN_ALLOW_FROM "Adresses des administrateurs autorisées sur Proxmox (CIDR séparés par des espaces)" \
+  "$ADMIN_ALLOW_FROM" "$CIDR_LIST_RE" "Liste d'adresses ou de réseaux CIDR attendue."
+if [[ -n $PVE_ROUTE && -z $ADMIN_ALLOW_FROM ]]; then
+  warn "Sans liste d'adresses, l'interface Proxmox serait ouverte à tout Internet (mot de passe + TOTP seulement)."
+  if (( PVE_OPEN_TO_ALL )) || ask_yn "Publier quand même l'interface Proxmox sans restriction d'adresse ?" n; then
+    PVE_OPEN_TO_ALL=1
+    warn "Interface Proxmox publiée pour toutes les adresses : activer le TOTP dès la première connexion."
+  else
+    PVE_OPEN_TO_ALL=0
+    warn "Interface Proxmox non publiée : relancer le script avec ADMIN_ALLOW_FROM pour la rendre accessible."
+    PVE_ROUTE=""
+  fi
+fi
+[[ -z $PVE_ROUTE || $PVE_ROUTE != "$COOLIFY_DOMAIN" ]] || die "Proxmox et Coolify doivent avoir deux adresses distinctes."
+if [[ -n $ADMIN_ALLOW_FROM ]]; then
+  if ask_yn "Réserver aussi Coolify à ces adresses (bloque les webhooks Git entrants) ?" "$( (( COOLIFY_ADMIN_ONLY )) && echo o || echo n)"; then
+    COOLIFY_ADMIN_ONLY=1
+  else
+    COOLIFY_ADMIN_ONLY=0
+  fi
+else
+  COOLIFY_ADMIN_ONLY=0
+fi
 
 LAN_GW="${LAN_PREFIX}.1"
 LAN_CIDR="${LAN_PREFIX}.0/24"
@@ -465,18 +523,24 @@ CT_IP="${LAN_PREFIX}.${CT_IP_SUFFIX}"
 
 # -----------------------------------------------------------------------------
 # 4. Plan des VM et budget de ressources
-#    Format : "ID|nom|vCPU|RAM_Go|Disque_Go|IP(dernier octet)|profil|ordre_démarrage"
+#    Format : "ID|nom|vCPU|RAM_Go|Disque_Go|IP(dernier octet)|profil|ordre_démarrage|domaines"
 # -----------------------------------------------------------------------------
-PROFILES="coolify kobo managed base"
+PROFILES="coolify managed base"
+SUBS_RE='^([a-z0-9.-]+(,[a-z0-9.-]+)*)?$'
 
 validate_plan() {
-  local spec id name cores ram disk oct profile order ids=" " octs=" ${CT_IP_SUFFIX} 1 " names=" "
+  local spec id name cores ram disk oct profile order subs ids=" " octs=" ${CT_IP_SUFFIX} 1 " names=" " n_coolify=0
   for spec in "${VMS[@]}"; do
-    IFS='|' read -r id name cores ram disk oct profile order <<<"$spec"
+    IFS='|' read -r id name cores ram disk oct profile order subs <<<"$spec"
     [[ $id =~ ^[0-9]+$ && $cores =~ ^[0-9]+$ && $ram =~ ^[0-9]+$ && $disk =~ ^[0-9]+$ && $oct =~ ^[0-9]+$ && $order =~ ^[0-9]+$ ]] \
       || die "Entrée VMS invalide : « ${spec} »."
     [[ $name =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "Nom de VM invalide : « ${name} » (minuscules, chiffres, tirets)."
+    if [[ $profile == kobo ]]; then
+      die "Profil « kobo » retiré : Kobo est un serveur piloté par Coolify (profil managed) qui déploie le Compose Kobo."
+    fi
     [[ " $PROFILES " == *" $profile "* ]] || die "Profil inconnu pour ${name} : ${profile} (${PROFILES})."
+    [[ $subs =~ $SUBS_RE ]] || die "Domaines invalides pour ${name} : « ${subs} » (noms séparés par des virgules)."
+    if [[ $profile == coolify ]]; then n_coolify=$((n_coolify + 1)); fi
     (( id >= 100 && id != CT_ID && id != TEMPLATE_ID )) || die "Identifiant de VM invalide ou déjà pris : ${id}."
     (( oct >= 2 && oct <= 254 )) || die "Adresse invalide pour ${name} : ${LAN_PREFIX}.${oct}."
     [[ $ids != *" $id "* ]] || die "Identifiant ${id} utilisé deux fois."
@@ -484,24 +548,26 @@ validate_plan() {
     [[ $names != *" $name "* ]] || die "Nom ${name} utilisé deux fois."
     ids+="$id "; octs+="$oct "; names+="$name "
   done
+  (( n_coolify <= 1 )) || die "Une seule VM Coolify : elle pilote toutes les autres."
 }
 
 show_plan() {
-  local spec id name cores ram disk oct profile order
-  printf '\n  %-6s %-18s %5s %7s %10s  %-15s %s\n' "ID" "Nom" "vCPU" "RAM Go" "Disque Go" "Adresse" "Profil"
+  local spec id name cores ram disk oct profile order subs
+  printf '\n  %-6s %-18s %5s %7s %10s  %-15s %-8s %s\n' "ID" "Nom" "vCPU" "RAM Go" "Disque Go" "Adresse" "Profil" "Domaines"
   printf '  %-6s %-18s %5s %7s %10s  %-15s %s\n' "$CT_ID" "${CT_NAME} (LXC)" "$CT_CORES" "$(( (CT_MEM_MB + 1023) / 1024 ))" "$CT_DISK_GB" "$CT_IP" "routeur web"
   for spec in "${VMS[@]}"; do
-    IFS='|' read -r id name cores ram disk oct profile order <<<"$spec"
-    printf '  %-6s %-18s %5s %7s %10s  %-15s %s\n' "$id" "$name" "$cores" "$ram" "$disk" "${LAN_PREFIX}.${oct}" "$profile"
+    IFS='|' read -r id name cores ram disk oct profile order subs <<<"$spec"
+    if [[ $profile == coolify ]]; then subs="$COOLIFY_DOMAIN"; fi
+    printf '  %-6s %-18s %5s %7s %10s  %-15s %-8s %s\n' "$id" "$name" "$cores" "$ram" "$disk" "${LAN_PREFIX}.${oct}" "$profile" "${subs//,/, }"
   done
   echo
 }
 
 compute_budget() {
-  local spec id name cores ram disk oct profile order
+  local spec id name cores ram disk oct profile order subs
   T_CORES=0; T_RAM=0; T_DISK=0; MAX_CORES=0
   for spec in "${VMS[@]}"; do
-    IFS='|' read -r id name cores ram disk oct profile order <<<"$spec"
+    IFS='|' read -r id name cores ram disk oct profile order subs <<<"$spec"
     T_CORES=$((T_CORES + cores)); T_RAM=$((T_RAM + ram)); T_DISK=$((T_DISK + disk))
     MAX_CORES=$(( cores > MAX_CORES ? cores : MAX_CORES ))
   done
@@ -526,15 +592,15 @@ check_budget() {
 }
 
 autoscale_plan() {
-  local spec id name cores ram disk oct profile order new=()
+  local spec id name cores ram disk oct profile order subs new=()
   compute_budget
   (( RAM_AVAIL >= ${#VMS[@]} )) || die "Pas assez de mémoire pour ${#VMS[@]} VM : en retirer."
   for spec in "${VMS[@]}"; do
-    IFS='|' read -r id name cores ram disk oct profile order <<<"$spec"
+    IFS='|' read -r id name cores ram disk oct profile order subs <<<"$spec"
     if (( T_RAM > RAM_AVAIL )); then ram=$(( ram * RAM_AVAIL / T_RAM )); ram=$(( ram < 1 ? 1 : ram )); fi
     if (( T_DISK > DISK_AVAIL )); then disk=$(( disk * DISK_AVAIL / T_DISK / 10 * 10 )); disk=$(( disk < 10 ? 10 : disk )); fi
     cores=$(( cores > HW_THREADS ? HW_THREADS : cores ))
-    new+=("${id}|${name}|${cores}|${ram}|${disk}|${oct}|${profile}|${order}")
+    new+=("${id}|${name}|${cores}|${ram}|${disk}|${oct}|${profile}|${order}|${subs}")
   done
   VMS=("${new[@]}")
 }
@@ -555,7 +621,7 @@ next_free() {  # next_free id|oct
   done
 }
 
-ask_vm_fields() {  # agit sur les variables id name cores ram disk oct profile order de l'appelant
+ask_vm_fields() {  # agit sur les variables id name cores ram disk oct profile order subs de l'appelant
   ask_match name "  Nom" "$name" '^[a-z0-9][a-z0-9-]{0,62}$' "Minuscules, chiffres et tirets."
   ask_int cores "  vCPU" "$cores" 1 "$HW_THREADS"
   ask_int ram "  RAM (Go)" "$ram" 1 "$HW_RAM_GB"
@@ -563,27 +629,33 @@ ask_vm_fields() {  # agit sur les variables id name cores ram disk oct profile o
   ask_int oct "  Adresse ${LAN_PREFIX}.?" "$oct" 2 254
   ask_choice profile "  Profil" "$profile" "$PROFILES"
   ask_int order "  Ordre de démarrage" "$order" 1 99
+  if [[ $profile == coolify ]]; then
+    subs=""
+  else
+    ask_match subs "  Domaines (noms séparés par des virgules, « kobo » = kobo.${WEB_DOMAIN})" "$subs" \
+      "$SUBS_RE" "Noms de domaine séparés par des virgules, sans espace."
+  fi
 }
 
 edit_plan() {
-  local spec id name cores ram disk oct profile order new=()
-  info "Profils : coolify = panneau Coolify ; managed = serveur piloté par Coolify ; kobo = Docker + kobo-install ; base = Ubuntu seul."
+  local spec id name cores ram disk oct profile order subs new=()
+  info "Profils : coolify = l'unique panneau Coolify ; managed = serveur Docker piloté par Coolify (une VM par stack) ; base = Ubuntu seul."
   for spec in "${VMS[@]}"; do
-    IFS='|' read -r id name cores ram disk oct profile order <<<"$spec"
+    IFS='|' read -r id name cores ram disk oct profile order subs <<<"$spec"
     if qm status "$id" >/dev/null 2>&1; then
       info "VM ${id} (${name}) déjà créée : inchangée."; new+=("$spec"); continue
     fi
     echo; info "VM ${id} — ${name}"
     if ! ask_yn "Garder cette VM ?" o; then continue; fi
     ask_vm_fields
-    new+=("${id}|${name}|${cores}|${ram}|${disk}|${oct}|${profile}|${order}")
+    new+=("${id}|${name}|${cores}|${ram}|${disk}|${oct}|${profile}|${order}|${subs}")
   done
   VMS=("${new[@]}")
   while ask_yn "Ajouter une VM ?" n; do
-    id="$(next_free id)"; name="vm${id}"; cores=2; ram=4; disk=50; oct="$(next_free oct)"; profile="managed"; order=5
+    id="$(next_free id)"; name="vm${id}"; cores=2; ram=4; disk=50; oct="$(next_free oct)"; profile="managed"; order=5; subs=""
     ask_int id "  Identifiant" "$id" 101 999999
     ask_vm_fields
-    VMS+=("${id}|${name}|${cores}|${ram}|${disk}|${oct}|${profile}|${order}")
+    VMS+=("${id}|${name}|${cores}|${ram}|${disk}|${oct}|${profile}|${order}|${subs}")
   done
 }
 
@@ -615,38 +687,73 @@ while :; do
   fi
 done
 
-COOLIFY_IP=""; KOBO_ID=""; TEST_ID=""; PROD_ID=""; FIRST_MANAGED=""
+if [[ $HW_DISK_TYPE == hdd ]]; then
+  warn "Disques HDD : capacité suffisante, mais PostgreSQL/PostGIS, Kobo et les outils BI en parallèle seront lents. NVMe/SSD conseillé ; mesurer la charge réelle avant la production."
+fi
+
+COOLIFY_IP=""; COOLIFY_ID=""
 declare -A VM_IP=() VM_NAME=()
 for spec in "${VMS[@]}"; do
   IFS='|' read -r id name _ _ _ oct profile _ <<<"$spec"
   VM_IP[$id]="${LAN_PREFIX}.${oct}"; VM_NAME[$id]="$name"
-  if [[ $profile == coolify && -z $COOLIFY_IP ]]; then COOLIFY_IP="${LAN_PREFIX}.${oct}"; fi
-  if [[ $profile == kobo && -z $KOBO_ID ]]; then KOBO_ID="$id"; fi
-  if [[ $profile == managed && -z $FIRST_MANAGED ]]; then FIRST_MANAGED="$id"; fi
-  if [[ $name == perso-tests ]]; then TEST_ID="$id"; fi
-  if [[ $name == uninef-prod ]]; then PROD_ID="$id"; fi
+  if [[ $profile == coolify ]]; then COOLIFY_IP="${LAN_PREFIX}.${oct}"; COOLIFY_ID="$id"; fi
 done
+[[ -n $COOLIFY_ID ]] || warn "Aucune VM Coolify dans le plan : les serveurs « managed » n'auront pas de panneau pour les piloter."
 
-# Routeur web : domaine (et ses sous-domaines) → VM ; tout le reste va à WEB_DEFAULT_VM
-WEB_DEFAULT_VM="${WEB_DEFAULT_VM:-${PROD_ID:-$FIRST_MANAGED}}"
-[[ -n $WEB_DEFAULT_VM && -n ${VM_IP[$WEB_DEFAULT_VM]-} ]] \
-  || die "WEB_DEFAULT_VM (« ${WEB_DEFAULT_VM} ») doit être l'identifiant d'une VM du plan."
+# Routeur web : domaine (et ses sous-domaines) → VM ; domaine inconnu refusé, sauf WEB_DEFAULT_VM
+if [[ -n $WEB_DEFAULT_VM && -z ${VM_IP[$WEB_DEFAULT_VM]-} ]]; then
+  die "WEB_DEFAULT_VM (« ${WEB_DEFAULT_VM} ») doit être vide ou l'identifiant d'une VM du plan."
+fi
 if (( ${#WEB_ROUTES[@]} == 0 )); then
-  if [[ -n $KOBO_ID ]]; then
-    WEB_ROUTES+=(".kobo.${WEB_DOMAIN}|${KOBO_ID}" ".ee.${WEB_DOMAIN}|${KOBO_ID}" ".kc.${WEB_DOMAIN}|${KOBO_ID}")
-  fi
-  if [[ -n $TEST_ID ]]; then WEB_ROUTES+=(".test.${WEB_DOMAIN}|${TEST_ID}"); fi
+  for spec in "${VMS[@]}"; do
+    IFS='|' read -r id _ _ _ _ _ profile _ subs <<<"$spec"
+    [[ $profile != coolify ]] || continue
+    IFS=',' read -r -a sub_list <<<"$subs"
+    for sub in "${sub_list[@]}"; do
+      if [[ $sub == *.* ]]; then WEB_ROUTES+=(".${sub}|${id}"); else WEB_ROUTES+=(".${sub}.${WEB_DOMAIN}|${id}"); fi
+    done
+  done
+  if [[ -n $COOLIFY_ID ]]; then WEB_ROUTES+=(".${COOLIFY_DOMAIN}|${COOLIFY_ID}"); fi
 fi
 for route in "${WEB_ROUTES[@]}"; do
   [[ ${route%%|*} =~ ^\.[a-z0-9.-]+\.[a-z]{2,}$ && -n ${VM_IP[${route#*|}]-} ]] \
     || die "Route web invalide : « ${route} » (format « .domaine|ID », la VM doit être dans le plan)."
+  if [[ -n $PVE_ROUTE && ${route%%|*} == ".${PVE_ROUTE}" ]]; then
+    die "La route « ${route} » reprend l'adresse de l'interface Proxmox (${PVE_ROUTE})."
+  fi
 done
+
+fw_rule() {  # fw_rule "règle" : remplace chaque « @ID » par l'adresse de la VM ID
+  local rule=$1 ref
+  while [[ $rule =~ @([0-9]+) ]]; do
+    ref=${BASH_REMATCH[1]}
+    [[ -n ${VM_IP[$ref]-} ]] || die "VM_FW_EXTRA : « @${ref} » ne correspond à aucune VM du plan."
+    rule=${rule/@${ref}/${VM_IP[$ref]}}
+  done
+  echo "$rule"
+}
+
+# Flux entre stacks : une règle dont la VM cible ou une VM citée a été retirée du plan est ignorée
+fw_extra=()
+for extra in "${VM_FW_EXTRA[@]}"; do
+  if [[ -n ${VM_IP[${extra%%|*}]-} ]] && ( fw_rule "${extra#*|}" ) >/dev/null 2>&1; then
+    fw_extra+=("$extra")
+  else
+    warn "Règle de pare-feu ignorée (VM absente du plan) : ${extra}"
+  fi
+done
+VM_FW_EXTRA=("${fw_extra[@]}")
 
 show_routes() {
   local route
-  printf '  Routeur web     80/443 de %s → %s ; par défaut : %s\n' "$PUBLIC_IP" "$CT_IP" "${VM_NAME[$WEB_DEFAULT_VM]}"
+  printf '  Routeur web     80/443 de %s → %s ; domaine inconnu : %s\n' "$PUBLIC_IP" "$CT_IP" \
+    "$([[ -n $WEB_DEFAULT_VM ]] && echo "${VM_NAME[$WEB_DEFAULT_VM]}" || echo "refusé")"
+  if [[ -n $PVE_ROUTE ]]; then
+    printf '                    %-42s → %s\n' "${PVE_ROUTE}" \
+      "hôte Proxmox (8006), $([[ -n $ADMIN_ALLOW_FROM ]] && echo "réservé à ${ADMIN_ALLOW_FROM}" || echo "OUVERT À TOUS")"
+  fi
   for route in "${WEB_ROUTES[@]}"; do
-    printf '                    %-28s → %s\n' "${route%%|*} (et sous-domaines)" "${VM_NAME[${route#*|}]}"
+    printf '                    %-42s → %s\n' "${route%%|*} (et sous-domaines)" "${VM_NAME[${route#*|}]}"
   done
 }
 
@@ -660,26 +767,29 @@ cat <<EOF
   Réseau privé    ${LAN_CIDR} sur ${LAN_BRIDGE}, passerelle ${LAN_GW}, NAT vers ${WAN_IF}
   SSH hôte        port ${SSH_PORT}, clé uniquement, depuis ${SSH_ALLOW_FROM:-tout Internet}
   Pare-feu        $( (( ENABLE_FIREWALL )) && echo "actif : seuls SSH, ping et 80/443 (vers le routeur web) entrent" || echo "DÉSACTIVÉ")
-  Administration  tunnels SSH (Proxmox 8006, Coolify 8000) ; interface Proxmox absente de l'IP publique
-  Isolation VM    $( (( VM_ISOLATION )) && echo "active (entrées : routeur web en 80/443, Coolify et hôte en SSH)" || echo "désactivée")
+  Administration  HTTPS sans tunnel : Coolify https://${COOLIFY_DOMAIN}$( (( COOLIFY_ADMIN_ONLY )) && echo " (adresses d'administration)") ; Proxmox $([[ -n $PVE_ROUTE ]] && echo "https://${PVE_ROUTE}" || echo "non publié")
+  Isolation VM    $( (( VM_ISOLATION )) && echo "active (entrées : routeur web en 80/443, Coolify et hôte en SSH, ${#VM_FW_EXTRA[@]} flux entre stacks)" || echo "désactivée")
   Alertes         ${ADMIN_EMAIL:-aucune adresse}$([[ -n $SMTP_HOST ]] && echo " via ${SMTP_HOST}")
   Sauvegardes     ${BACKUP_SCHEDULE} sur ${BACKUP_STORAGE} : ${BACKUP_KEEP_DAILY} quotidiennes, ${BACKUP_KEEP_WEEKLY} hebdomadaires
+  Hors serveur    $([[ -n $BACKUP_REMOTE_STORAGE ]] && echo "${BACKUP_REMOTE_SCHEDULE} sur ${BACKUP_REMOTE_STORAGE}" || echo "AUCUNE copie hors serveur")
   Ubuntu des VM   ${UBUNTU_RELEASE} (modèle ${TEMPLATE_ID})
 EOF
 show_routes
 show_plan
 
 save_answers() {
-  local header
+  local header PVE_DOMAIN=${PVE_DOMAIN:--}   # « - » : interface Proxmox volontairement non publiée
   header="# Réponses de ks5-setup.sh du $(date '+%F %T'). Relancer : $(rerun_cmd -c /root/ks5-reponses.conf)"
   {
     echo "$header"
     echo "# Le mot de passe SMTP n'est jamais enregistré ici."
     declare -p TIMEZONE ADMIN_EMAIL SMTP_HOST SMTP_PORT SMTP_MODE SMTP_USER SMTP_FROM SSH_PORT SSH_ALLOW_FROM \
-      ENABLE_FIREWALL VM_ISOLATION GUI_LAN_ONLY ROLLBACK_DELAY HW_THREADS HW_RAM_GB HW_DISK_TYPE HW_RAID \
+      ENABLE_FIREWALL VM_ISOLATION GUI_LAN_ONLY ROLLBACK_DELAY ADMIN_ALLOW_FROM PVE_DOMAIN PVE_OPEN_TO_ALL \
+      COOLIFY_DOMAIN COOLIFY_ADMIN_ONLY HW_THREADS HW_RAM_GB HW_DISK_TYPE HW_RAID \
       HW_USABLE_GB ZFS_ARC_MAX_GB HOST_RESERVE_GB DISK_BUDGET_PCT LAN_BRIDGE LAN_PREFIX DNS_SERVERS STORAGE \
       VMDATA_DATASET TEMPLATE_ID UBUNTU_RELEASE CI_USER WEB_DOMAIN WEB_DEFAULT_VM WEB_ROUTES BACKUP_STORAGE \
-      BACKUP_SCHEDULE BACKUP_KEEP_DAILY BACKUP_KEEP_WEEKLY DISK_ALERT_PCT CT_ID CT_NAME CT_IP_SUFFIX CT_CORES \
+      BACKUP_SCHEDULE BACKUP_KEEP_DAILY BACKUP_KEEP_WEEKLY BACKUP_REMOTE_STORAGE BACKUP_REMOTE_SCHEDULE \
+      BACKUP_REMOTE_KEEP_DAILY BACKUP_REMOTE_KEEP_WEEKLY BACKUP_REMOTE_KEEP_MONTHLY DISK_ALERT_PCT CT_ID CT_NAME CT_IP_SUFFIX CT_CORES \
       CT_MEM_MB CT_DISK_GB VMS VM_FW_EXTRA
   } >"$ANSWERS_FILE"
   chmod 600 "$ANSWERS_FILE"
@@ -951,7 +1061,7 @@ policy_out: ACCEPT
 [ALIASES]
 local_network ${LAN_GW}/32 # remplace la détection automatique, qui ouvrirait la gestion au sous-réseau public OVH
 
-[IPSET management] # interface 8006 et consoles : l'hôte lui-même, donc uniquement par tunnel SSH
+[IPSET management] # ensemble « gestion » de Proxmox réduit à l'hôte ; l'interface est publiée par le routeur web
 ${LAN_GW}
 EOF
   if [[ -n $SSH_ALLOW_FROM ]]; then
@@ -965,9 +1075,13 @@ EOF
     echo "IN ACCEPT -i ${WAN_IF} -p tcp -dport ${SSH_PORT} -log nolog # SSH public (clé uniquement, fail2ban)"
   fi
   echo "IN Ping(ACCEPT) -log nolog # supervision OVH (sans réponse au ping, OVH intervient sur le serveur)"
+  if [[ -n $PVE_ROUTE ]]; then
+    echo "IN ACCEPT -source ${CT_IP} -p tcp -dport 8006 -log nolog # interface Proxmox publiée par le routeur web (${PVE_ROUTE})"
+    echo "IN ACCEPT -source ${CT_IP} -p tcp -dport 80 -log nolog # validation Let's Encrypt du certificat Proxmox (ACME)"
+  fi
   printf '\n[group vm-base] # entrées communes à toutes les VM\n'
   echo "IN ACCEPT -source ${CT_IP} -p tcp -dport 80,443 -log nolog # routeur web : sites publics"
-  echo "IN ACCEPT -source ${LAN_GW} -p tcp -dport 22 -log nolog # administration SSH par rebond sur l'hôte"
+  echo "IN ACCEPT -source ${LAN_GW} -p tcp -dport 22 -log nolog # administration SSH depuis l'hôte"
   if [[ -n $COOLIFY_IP ]]; then
     echo "IN ACCEPT -source ${COOLIFY_IP} -p tcp -dport 22 -log nolog # Coolify pilote les serveurs en SSH"
   fi
@@ -1168,7 +1282,7 @@ chmod 600 "${KEYS_DIR}"/*
 
 # Vendor-data : complète la configuration cloud-init générée par Proxmox (utilisateur, clés, réseau)
 write_snippet() {  # fichier disable_root write_files_en_plus runcmd_en_plus
-  put 644 "${SNIPPETS_DIR}/$1" <<EOF
+  put 600 "${SNIPPETS_DIR}/$1" <<EOF
 #cloud-config
 # ks5-setup
 timezone: ${TIMEZONE}
@@ -1205,11 +1319,22 @@ DOCKER_LOGS='  - path: /etc/docker/daemon.json
     content: |
       {"log-driver": "json-file", "log-opts": {"max-size": "10m", "max-file": "3"}}
 '
+# Compte administrateur de Coolify créé à l'installation : personne ne peut le prendre en
+# s'inscrivant le premier. Mot de passe aléatoire conservé sur l'hôte, à changer à la première connexion.
+COOLIFY_ENV=""
+if [[ $ADMIN_EMAIL =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
+  if [[ ! -s "${KEYS_DIR}/coolify-admin.txt" ]]; then
+    COOLIFY_PW="$(openssl rand -base64 30 | tr -dc 'A-Za-z0-9')"
+    COOLIFY_PW="Ks5@${COOLIFY_PW:0:20}9a"   # majuscule, minuscule, chiffre et symbole exigés par Coolify
+    printf 'Coolify  https://%s\nCompte   %s\nPasse    %s\n' "$COOLIFY_DOMAIN" "$ADMIN_EMAIL" "$COOLIFY_PW" \
+      | put 600 "${KEYS_DIR}/coolify-admin.txt"
+  fi
+  COOLIFY_PW="$(awk '$1 == "Passe" {print $2}' "${KEYS_DIR}/coolify-admin.txt")"
+  COOLIFY_ENV="env ROOT_USERNAME=admin ROOT_USER_EMAIL='${ADMIN_EMAIL}' ROOT_USER_PASSWORD='${COOLIFY_PW}' "
+fi
 write_snippet "ks5-base.yaml" true "" ""
 write_snippet "ks5-managed.yaml" false "$DOCKER_LOGS" ""
-write_snippet "ks5-coolify.yaml" true "" '  - "curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash"'
-write_snippet "ks5-kobo.yaml" true "$DOCKER_LOGS" '  - "curl -fsSL https://get.docker.com | sh"
-  - "git clone --depth 1 https://github.com/kobotoolbox/kobo-install.git /opt/kobo-install"'
+write_snippet "ks5-coolify.yaml" true "" "  - \"curl -fsSL https://cdn.coollabs.io/coolify/install.sh | ${COOLIFY_ENV}bash\""
 ok "Clés dans ${KEYS_DIR}, fichiers cloud-init dans ${SNIPPETS_DIR}."
 
 # -----------------------------------------------------------------------------
@@ -1290,7 +1415,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade
-apt-get -y -q install haproxy unattended-upgrades
+apt-get -y -q install haproxy openssl unattended-upgrades
 # Correctifs de sécurité Debian automatiques (HAProxy compris)
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'X'
 APT::Periodic::Update-Package-Lists "1";
@@ -1302,7 +1427,9 @@ systemctl disable --now ssh.socket ssh.service >/dev/null 2>&1 || true
 EOF
 
 gen_haproxy_cfg() {
-  local spec id name oct profile proxy
+  local spec id name oct profile proxy def="${WEB_DEFAULT_VM:-none}" pve_sni admin_acl=""
+  if [[ -n $ADMIN_ALLOW_FROM ]]; then admin_acl="    acl admin_src src ${ADMIN_ALLOW_FROM}"; fi
+  pve_sni="req.ssl_sni,lower -m str ${PVE_ROUTE}"
   cat <<EOF
 # ks5-setup : régénéré à chaque exécution du script, ne pas modifier ici.
 # Domaines → VM : /etc/haproxy/domaines.map, puis « systemctl reload haproxy ».
@@ -1313,6 +1440,7 @@ global
     group haproxy
     maxconn 4096
     stats socket /run/haproxy/admin.sock mode 600 level admin
+    ssl-default-bind-options ssl-min-ver TLSv1.2
 
 defaults
     log global
@@ -1327,22 +1455,99 @@ defaults
 frontend http_in
     bind :80
     mode http
-    use_backend http_%[req.hdr(host),field(1,:),lower,regsub(^,.),map_end(/etc/haproxy/domaines.map,${WEB_DEFAULT_VM})]
-    default_backend http_${WEB_DEFAULT_VM}
+EOF
+  if [[ -n $PVE_ROUTE ]]; then
+    echo "    use_backend http_pve if { req.hdr(host),field(1,:),lower -m str ${PVE_ROUTE} }"
+  fi
+  cat <<EOF
+    use_backend http_%[req.hdr(host),field(1,:),lower,regsub(^,.),map_end(/etc/haproxy/domaines.map,${def})]
+    default_backend http_${def}
 
 # HTTPS (443) : aiguillage sur le nom demandé (SNI), sans déchiffrer ; chaque VM garde ses certificats
 frontend https_in
     bind :443
     mode tcp
-    tcp-request inspect-delay 5s
-    tcp-request content accept if { req.ssl_hello_type 1 }
-    use_backend tls_%[req.ssl_sni,lower,regsub(^,.),map_end(/etc/haproxy/domaines.map,${WEB_DEFAULT_VM})]
-    default_backend tls_${WEB_DEFAULT_VM}
 EOF
+  if [[ -n $admin_acl ]]; then echo "$admin_acl"; fi
+  echo "    tcp-request inspect-delay 5s"
+  if [[ -n $PVE_ROUTE && -n $ADMIN_ALLOW_FROM ]]; then
+    echo "    tcp-request content reject if { ${pve_sni} } !admin_src"
+  fi
+  if (( COOLIFY_ADMIN_ONLY )) && [[ -n $COOLIFY_ID ]]; then
+    echo "    tcp-request content reject if { req.ssl_sni,lower,regsub(^,.) -m end .${COOLIFY_DOMAIN} } !admin_src"
+  fi
+  echo "    tcp-request content accept if { req.ssl_hello_type 1 }"
+  if [[ -n $PVE_ROUTE ]]; then echo "    use_backend tls_pve if { ${pve_sni} }"; fi
+  cat <<EOF
+    use_backend tls_%[req.ssl_sni,lower,regsub(^,.),map_end(/etc/haproxy/domaines.map,${def})]
+    default_backend tls_${def}
+
+# Domaine inconnu : refusé plutôt qu'envoyé à une application
+backend http_none
+    mode http
+    http-request deny deny_status 404
+
+backend tls_none
+    mode tcp
+    tcp-request content reject
+EOF
+  if [[ -n $PVE_ROUTE ]]; then
+    cat <<EOF
+
+# Interface Proxmox de l'hôte (${PVE_ROUTE}) : HTTPS de Proxmox transmis tel quel
+backend http_pve # validation Let's Encrypt du certificat Proxmox (pvenode acme)
+    mode http
+    server pve ${LAN_GW}:80
+
+backend tls_pve
+    mode tcp
+    server pve ${LAN_GW}:8006
+EOF
+  fi
+  if [[ -n $COOLIFY_ID ]]; then
+    cat <<EOF
+
+# Amorçage de Coolify (valeur « boot » dans la table) : tant que son domaine n'est pas réglé dans
+# Coolify, son proxy ne tourne pas. Le routeur termine alors HTTPS avec un certificat provisoire
+# et transmet à l'interface (8000). Domaine réglé : remplacer « boot » par ${COOLIFY_ID} dans la table.
+backend http_boot
+    mode http
+    http-request redirect scheme https code 301 unless { path_beg /.well-known/acme-challenge/ }
+    server ${VM_NAME[$COOLIFY_ID]} ${COOLIFY_IP}:80 send-proxy-v2
+
+backend tls_boot
+    mode tcp
+    server boot abns@ks5-coolify-boot send-proxy-v2
+
+frontend coolify_boot
+    mode http
+    bind abns@ks5-coolify-boot accept-proxy ssl crt /etc/haproxy/coolify-boot.pem
+EOF
+    if [[ -n $admin_acl ]]; then echo "$admin_acl"; echo "    http-request deny deny_status 403 if !admin_src"; fi
+    cat <<EOF
+    option forwardfor
+    http-request set-header X-Forwarded-Proto https
+    use_backend coolify_realtime if { path_beg /app }
+    use_backend coolify_terminal if { path_beg /terminal/ws }
+    default_backend coolify_ui
+
+backend coolify_ui
+    mode http
+    server ${VM_NAME[$COOLIFY_ID]} ${COOLIFY_IP}:8000
+
+backend coolify_realtime
+    mode http
+    server ${VM_NAME[$COOLIFY_ID]} ${COOLIFY_IP}:6001
+
+backend coolify_terminal
+    mode http
+    server ${VM_NAME[$COOLIFY_ID]} ${COOLIFY_IP}:6002
+EOF
+  fi
   for spec in "${VMS[@]}"; do
     IFS='|' read -r id name _ _ _ oct profile _ <<<"$spec"
-    # Traefik des serveurs Coolify reçoit l'adresse du visiteur par le protocole PROXY
-    if [[ $profile == managed ]]; then proxy=" send-proxy-v2"; else proxy=""; fi
+    # Traefik de Coolify (panneau et serveurs gérés) reçoit l'adresse du visiteur par le protocole PROXY
+    if [[ $profile == managed || $profile == coolify ]]; then proxy=" send-proxy-v2"; else proxy=""; fi
     printf '\nbackend http_%s # %s\n    mode http\n    server %s %s:80%s\n' "$id" "$name" "$name" "${LAN_PREFIX}.${oct}" "$proxy"
     printf '\nbackend tls_%s # %s\n    mode tcp\n    server %s %s:443%s\n' "$id" "$name" "$name" "${LAN_PREFIX}.${oct}" "$proxy"
   done
@@ -1351,11 +1556,18 @@ EOF
 gen_haproxy_map() {
   local route id
   echo "# ks5-setup : « .domaine » = ce domaine et tous ses sous-domaines → identifiant de la VM."
-  echo "# Domaine absent : VM ${WEB_DEFAULT_VM} (${VM_NAME[$WEB_DEFAULT_VM]}). Après modification : systemctl reload haproxy"
+  echo "# Domaine absent : $([[ -n $WEB_DEFAULT_VM ]] && echo "VM ${WEB_DEFAULT_VM} (${VM_NAME[$WEB_DEFAULT_VM]})" || echo "refusé (404 en HTTP, connexion fermée en HTTPS)")."
+  echo "# Après modification : systemctl reload haproxy"
   echo "# Pas de commentaire en fin de ligne : HAProxy le lirait comme faisant partie de la valeur."
+  if [[ -n $COOLIFY_ID ]]; then
+    echo "# « boot » : amorçage de Coolify (certificat provisoire du routeur). Une fois le domaine réglé"
+    echo "# dans Coolify et son proxy démarré, remplacer « boot » par ${COOLIFY_ID}."
+  fi
   for id in "${!VM_NAME[@]}"; do echo "#   ${id} = ${VM_NAME[$id]}"; done | sort
   for route in "${WEB_ROUTES[@]}"; do
-    printf '%-32s %s\n' "${route%%|*}" "${route#*|}"
+    id="${route#*|}"
+    if [[ $id == "$COOLIFY_ID" ]]; then id="boot"; fi
+    printf '%-32s %s\n' "${route%%|*}" "$id"
   done
 }
 
@@ -1365,6 +1577,18 @@ if ! pct exec "$CT_ID" -- test -f /etc/haproxy/domaines.map; then
   gen_haproxy_map >"$HAP_TMP"
   pct push "$CT_ID" "$HAP_TMP" /etc/haproxy/domaines.map --perms 0644
 fi
+COOLIFY_BOOT_FP=""
+if [[ -n $COOLIFY_ID ]]; then
+  # Certificat provisoire de l'amorçage de Coolify, créé une fois dans le conteneur
+  # shellcheck disable=SC2016  # script exécuté dans le conteneur, $1 = domaine de Coolify
+  pct exec "$CT_ID" -- sh -c 'test -s /etc/haproxy/coolify-boot.pem && exit 0
+    d=$(mktemp -d) && openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=$1" \
+      -addext "subjectAltName=DNS:$1" -keyout "$d/k" -out "$d/c" 2>/dev/null \
+      && cat "$d/c" "$d/k" > /etc/haproxy/coolify-boot.pem && chmod 600 /etc/haproxy/coolify-boot.pem; rm -rf "$d"' \
+    sh "$COOLIFY_DOMAIN" || die "Certificat provisoire de Coolify non créé dans le conteneur ${CT_ID}."
+  COOLIFY_BOOT_FP="$(pct exec "$CT_ID" -- openssl x509 -in /etc/haproxy/coolify-boot.pem -noout -fingerprint -sha256 \
+    | cut -d= -f2)" || true
+fi
 gen_haproxy_cfg >"$HAP_TMP"
 pct push "$CT_ID" "$HAP_TMP" /etc/haproxy/haproxy.cfg.new --perms 0644
 rm -f "$HAP_TMP"
@@ -1373,7 +1597,7 @@ pct exec "$CT_ID" -- haproxy -c -q -f /etc/haproxy/haproxy.cfg.new \
 pct exec "$CT_ID" -- mv /etc/haproxy/haproxy.cfg.new /etc/haproxy/haproxy.cfg
 pct exec "$CT_ID" -- systemctl enable haproxy >/dev/null 2>&1
 pct exec "$CT_ID" -- systemctl reload-or-restart haproxy
-ok "Routeur web prêt : 80/443 aiguillés par domaine (table : pct exec ${CT_ID} -- cat /etc/haproxy/domaines.map)."
+ok "Routeur web prêt : 80/443 aiguillés par domaine, domaines inconnus refusés (table : pct exec ${CT_ID} -- cat /etc/haproxy/domaines.map)."
 
 # -----------------------------------------------------------------------------
 # I. Machines virtuelles (pare-feu par VM : entrées limitées au routeur web, à Coolify et à l'hôte)
@@ -1387,11 +1611,11 @@ write_vm_fw() {  # id ip profil
     printf '[IPSET ipfilter-net0] # seule adresse source autorisée (anti-usurpation)\n%s\n\n' "$2"
     printf '[RULES]\nGROUP vm-base\n'
     if [[ $3 == coolify ]]; then
-      echo "IN ACCEPT -source ${LAN_GW} -p tcp -dport 8000,6001,6002 -log nolog # interface Coolify par tunnel SSH"
+      echo "IN ACCEPT -source ${CT_IP} -p tcp -dport 8000,6001,6002 -log nolog # amorçage de Coolify par le routeur web (HTTPS)"
       echo "IN ACCEPT -source ${LAN_CIDR} -p tcp -dport 8000 -log nolog # Sentinel des serveurs gérés"
     fi
     for extra in "${VM_FW_EXTRA[@]}"; do
-      if [[ ${extra%%|*} == "$1" ]]; then echo "${extra#*|}"; fi
+      if [[ ${extra%%|*} == "$1" ]]; then fw_rule "${extra#*|}"; fi
     done
   } >"$f"
 }
@@ -1406,7 +1630,6 @@ for spec in "${VMS[@]}"; do
   fi
   case "$profile" in
     coolify) snippet="ks5-coolify.yaml"; keys="${KEYS_DIR}/admin.pub" ;;
-    kobo)    snippet="ks5-kobo.yaml";    keys="${KEYS_DIR}/admin.pub" ;;
     managed) snippet="ks5-managed.yaml"; keys="${KEYS_DIR}/managed.pub" ;;
     base)    snippet="ks5-base.yaml";    keys="${KEYS_DIR}/admin.pub" ;;
   esac
@@ -1443,6 +1666,32 @@ else
   ok "Sauvegarde quotidienne à ${BACKUP_SCHEDULE} (${PRUNE})."
 fi
 
+# Copie hors serveur : seule protection contre la perte du serveur lui-même
+if [[ -n $BACKUP_REMOTE_STORAGE ]]; then
+  if pvesm status --storage "$BACKUP_REMOTE_STORAGE" 2>/dev/null | awk 'NR>1 {print $3}' | grep -qx active \
+     && [[ ",$(storage_content "$BACKUP_REMOTE_STORAGE")," == *",backup,"* ]]; then
+    RPRUNE="keep-daily=${BACKUP_REMOTE_KEEP_DAILY},keep-weekly=${BACKUP_REMOTE_KEEP_WEEKLY},keep-monthly=${BACKUP_REMOTE_KEEP_MONTHLY}"
+    if grep -qE '^vzdump:[[:space:]]+ks5-distant$' /etc/pve/jobs.cfg 2>/dev/null; then
+      pvesh set /cluster/backup/ks5-distant --schedule "$BACKUP_REMOTE_SCHEDULE" --storage "$BACKUP_REMOTE_STORAGE" \
+        --prune-backups "$RPRUNE"
+      ok "Tâche ks5-distant mise à jour."
+    else
+      rargs=(--id ks5-distant --schedule "$BACKUP_REMOTE_SCHEDULE" --storage "$BACKUP_REMOTE_STORAGE" --all 1
+             --exclude "$TEMPLATE_ID" --mode snapshot --prune-backups "$RPRUNE" --enabled 1)
+      # Proxmox Backup Server compresse et déduplique lui-même ; les autres stockages reçoivent des archives zstd
+      if [[ "$(pvesm status --storage "$BACKUP_REMOTE_STORAGE" | awk 'NR>1 {print $2}')" != pbs ]]; then
+        rargs+=(--compress zstd)
+      fi
+      pvesh create /cluster/backup "${rargs[@]}"
+      ok "Copie hors serveur à ${BACKUP_REMOTE_SCHEDULE} vers ${BACKUP_REMOTE_STORAGE} (${RPRUNE})."
+    fi
+  else
+    warn "Stockage ${BACKUP_REMOTE_STORAGE} absent, inactif ou sans contenu « backup » : copie hors serveur NON configurée."
+  fi
+else
+  warn "Aucune copie hors serveur : à ajouter avant la production (BACKUP_REMOTE_STORAGE, README section 5)."
+fi
+
 # -----------------------------------------------------------------------------
 # K. Contrôles et récapitulatif
 # -----------------------------------------------------------------------------
@@ -1456,7 +1705,7 @@ check "SSH : root par clé uniquement" "sshd -T | grep -qE '^permitrootlogin (wi
 check "fail2ban surveille SSH" "fail2ban-client status sshd"
 if (( ENABLE_FIREWALL )); then
   check "Pare-feu Proxmox actif" "pve-firewall status | grep -q 'enabled/running'"
-  check "Gestion limitée à l'hôte (tunnels SSH)" "pve-firewall localnet | grep -q '${LAN_GW}/32'"
+  check "Gestion Proxmox limitée à l'hôte (pas au sous-réseau public OVH)" "pve-firewall localnet | grep -q '${LAN_GW}/32'"
 fi
 check "Interface 8006 absente de l'IP publique" \
   "! ss -Hltn 'sport = :8006' | awk '{print \$4}' | grep -qE -e '^(\*|0\.0\.0\.0|\[::\]):8006\$' -e '^${PUBLIC_IP}:8006\$'"
@@ -1467,8 +1716,16 @@ check "80/443 redirigés vers le routeur web" \
 check "Autres entrées vers le réseau privé bloquées" \
   "iptables -C FORWARD ! -i ${LAN_BRIDGE} -o ${LAN_BRIDGE} -m conntrack --ctstate NEW -m conntrack ! --ctstate DNAT -j DROP"
 check "Routeur web démarré" "pct exec ${CT_ID} -- systemctl is-active haproxy"
+check "Domaines inconnus refusés par le routeur" "pct exec ${CT_ID} -- grep -q 'default_backend tls_${WEB_DEFAULT_VM:-none}' /etc/haproxy/haproxy.cfg"
+if [[ -n $PVE_ROUTE && -n $ADMIN_ALLOW_FROM ]]; then
+  check "Interface Proxmox réservée aux adresses d'administration" \
+    "pct exec ${CT_ID} -- grep -q 'tcp-request content reject if { req.ssl_sni,lower -m str ${PVE_ROUTE} } !admin_src' /etc/haproxy/haproxy.cfg"
+fi
 if (( USES_ZFS )); then check "Pools ZFS en bon état" "zpool status -x | grep -q 'all pools are healthy'"; fi
 check "Tâche de sauvegarde présente" "grep -q 'ks5-daily' /etc/pve/jobs.cfg"
+if [[ -n $BACKUP_REMOTE_STORAGE ]]; then
+  check "Copie hors serveur programmée (${BACKUP_REMOTE_STORAGE})" "grep -q 'ks5-distant' /etc/pve/jobs.cfg"
+fi
 
 REBOOT_NEEDED=0
 LATEST_KERNEL="$(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -V | tail -1 || true)"
@@ -1491,14 +1748,16 @@ EOF
   cat <<EOF
   Table des domaines  pct exec ${CT_ID} -- nano /etc/haproxy/domaines.map  puis  pct exec ${CT_ID} -- systemctl reload haproxy
 
-Administration (depuis votre poste, par tunnel SSH)
-  Interface Proxmox   ssh -p ${SSH_PORT} -L 8006:${LAN_GW}:8006 root@${PUBLIC_IP}   puis https://localhost:8006
-$([[ -n $COOLIFY_IP ]] && echo "  Coolify             ssh -p ${SSH_PORT} -L 8000:${COOLIFY_IP}:8000 -L 6001:${COOLIFY_IP}:6001 -L 6002:${COOLIFY_IP}:6002 root@${PUBLIC_IP}   puis http://localhost:8000")
-  SSH d'une VM        ssh -p ${SSH_PORT} -J root@${PUBLIC_IP} ${CI_USER}@<adresse>
+Administration (HTTPS depuis votre navigateur, aucun tunnel)
+  Coolify             https://${COOLIFY_DOMAIN}$([[ -n $COOLIFY_BOOT_FP ]] && printf '\n                      amorçage : certificat provisoire du routeur, empreinte SHA-256\n                      %s' "$COOLIFY_BOOT_FP")
+  Proxmox             $([[ -n $PVE_ROUTE ]] && echo "https://${PVE_ROUTE}  ($([[ -n $ADMIN_ALLOW_FROM ]] && echo "depuis ${ADMIN_ALLOW_FROM}" || echo "ouvert à tous : TOTP obligatoire"))" || echo "non publié (ADMIN_ALLOW_FROM vide)")
+  SSH de l'hôte       ssh -p ${SSH_PORT} root@${PUBLIC_IP}
+  SSH d'une VM        depuis l'hôte : ssh -i ${KEYS_DIR}/coolify_ed25519 root@<adresse>  (ou Terminal dans Coolify)
   Console d'une VM    qm terminal <id>   ·   qm guest exec <id> -- <commande>
 
 Fichiers
   Clé privée Coolify  ${KEYS_DIR}/coolify_ed25519
+$([[ -s ${KEYS_DIR}/coolify-admin.txt ]] && echo "  Compte Coolify      ${KEYS_DIR}/coolify-admin.txt (mot de passe à changer à la première connexion)")
   Réponses            ${ANSWERS_FILE}
   Sauvegardes config  ${BACKUP_DIR}
   Journal             ${LOG_FILE}
@@ -1519,6 +1778,7 @@ fi
 if (( REBOOT_NEEDED )); then warn "Nouveau noyau installé : redémarrer le serveur (reboot) dès que possible."; fi
 info "Récapitulatif enregistré dans ${SUMMARY_FILE}."
 info "Relancer avec les mêmes réponses : $(rerun_cmd -c "$ANSWERS_FILE")"
-info "Étapes suivantes (Coolify, DNS, Kobo) : https://github.com/kv5t/ks5-proxmox-setup#4-après-linstallation"
+if [[ -z $BACKUP_REMOTE_STORAGE ]]; then warn "Aucune copie hors serveur : à mettre en place avant la production."; fi
+info "Étapes suivantes (DNS, Coolify, stacks) : https://github.com/kv5t/ks5-proxmox-setup#4-après-linstallation"
 exit 0
 }
