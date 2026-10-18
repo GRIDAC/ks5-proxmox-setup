@@ -199,7 +199,8 @@ des domaines), réservé aux adresses d'administration si elles sont indiquées.
    empreinte SHA-256 avec celle de `/root/ks5-resume.txt`, puis accepter.
 2. Se connecter avec le compte créé à l'installation : `cat /root/ks5-keys/coolify-admin.txt`
    (sur l'hôte). **Changer ce mot de passe** et activer la 2FA (profil). Sans mail
-   d'administrateur fourni au script, créer le compte tout de suite.
+   d'administrateur fourni au script (ou si Coolify a refusé ce compte à l'installation), la
+   page d'inscription s'affiche : créer le compte tout de suite.
 3. Settings : désactiver les inscriptions.
 4. Servers › localhost › Proxy › Configuration : ajouter à la liste `command` de Traefik,
    enregistrer :
